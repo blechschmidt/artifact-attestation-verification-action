@@ -76,13 +76,14 @@ jobs:
           if [ -n "$TAG" ]; then
             TAGS="$TAG"
           else
-            LIMIT_ARG="--limit 1000"
+            echo "Fetching release list for $REPO (paginated) ..."
+            # Use the REST API with --paginate so every page is fetched
+            # regardless of how many releases the repository has.
+            TAGS=$(gh api --paginate "/repos/$REPO/releases" --jq '.[].tag_name')
+            # Apply optional limit AFTER fetching all pages
             if [ "${LIMIT:-0}" -gt 0 ]; then
-              LIMIT_ARG="--limit $LIMIT"
+              TAGS=$(echo "$TAGS" | head -n "$LIMIT")
             fi
-            echo "Fetching release list for $REPO ..."
-            # shellcheck disable=SC2086
-            TAGS=$(gh release list --repo "$REPO" $LIMIT_ARG --json tagName --jq '.[].tagName')
             if [ -z "$TAGS" ]; then
               echo "No releases found for $REPO"
               echo "verified=0" >> "$GITHUB_OUTPUT"
