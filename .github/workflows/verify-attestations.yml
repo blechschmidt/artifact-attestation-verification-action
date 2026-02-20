@@ -11,7 +11,11 @@ on:
         type: string
         default: ''
       tag:
-        description: 'Specific release tag to verify. Checks all releases if not set.'
+        description: >
+          Literal release tag to verify (e.g. v1.2.3), OR a semver constraint
+          expression to select matching releases (e.g. >=1.2.0, <2.0.0,
+          ^1.2.0, ~1.2, >=1.0.0,<2.0.0).
+          Checks every release when not specified.
         required: false
         type: string
         default: ''
@@ -60,7 +64,85 @@ jobs:
         run: |
           set -uo pipefail
 
-          # Fall back to calling repository when no repository is specified
+          # ── Semver filter helper (pure Python, no external deps) ────────────
+          cat > /tmp/semver_filter.py << 'PYEOF'
+          """
+          Read release tag names from stdin, print those that satisfy the semver
+          constraint given as argv[1].
+
+          Supported operators:  >  >=  <  <=  ==  =  !=
+          Caret ranges:  ^1.2.3  →  >=1.2.3,<2.0.0
+          Tilde ranges:  ~1.2.3  →  >=1.2.3,<1.3.0
+                         ~1.2    →  >=1.2.0,<1.3.0
+                         ~1      →  >=1.0.0,<2.0.0
+          Comma-separated multi-constraints:  >=1.0.0,<2.0.0
+          """
+          import re, sys
+
+          def parse_ver(s):
+              s = re.sub(r'^[vV]', '', s)
+              m = re.match(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?', s)
+              if not m:
+                  return None
+              return tuple(int(x) if x else 0 for x in m.groups())
+
+          def expand_caret(ver_str):
+              v = parse_ver(ver_str)
+              if v is None:
+                  return None, None
+              return v, (v[0] + 1, 0, 0)
+
+          def expand_tilde(ver_str):
+              v = parse_ver(ver_str)
+              if v is None:
+                  return None, None
+              segs = re.sub(r'^[vV]', '', ver_str).split('.')
+              if len(segs) >= 2:
+                  return v, (v[0], v[1] + 1, 0)
+              return v, (v[0] + 1, 0, 0)
+
+          def matches(tag, constraint):
+              v = parse_ver(tag)
+              if v is None:
+                  return False
+              for part in constraint.split(','):
+                  part = part.strip()
+                  if not part:
+                      continue
+                  if part.startswith('^'):
+                      lo, hi = expand_caret(part[1:])
+                      if lo is None or not (v >= lo and v < hi):
+                          return False
+                  elif part.startswith('~'):
+                      lo, hi = expand_tilde(part[1:])
+                      if lo is None or not (v >= lo and v < hi):
+                          return False
+                  else:
+                      m2 = re.match(r'^(>=|<=|==|!=|>|<|=)(.+)$', part)
+                      if not m2:
+                          ver = parse_ver(part)
+                          if ver is None or v != ver:
+                              return False
+                      else:
+                          op, rhs = m2.group(1), parse_ver(m2.group(2))
+                          if rhs is None:
+                              return False
+                          if op in ('==', '=') and v != rhs: return False
+                          if op == '!='           and v == rhs: return False
+                          if op == '>='           and v <  rhs: return False
+                          if op == '<='           and v >  rhs: return False
+                          if op == '>'            and v <= rhs: return False
+                          if op == '<'            and v >= rhs: return False
+              return True
+
+          constraint = sys.argv[1] if len(sys.argv) > 1 else ''
+          for tag in sys.stdin.read().splitlines():
+              tag = tag.strip()
+              if tag and matches(tag, constraint):
+                  print(tag)
+          PYEOF
+
+          # ── Resolve target repository ───────────────────────────────────────
           REPO="${INPUT_REPO:-}"
           if [ -z "$REPO" ]; then
             REPO="$CALLER_REPO"
@@ -73,29 +155,47 @@ jobs:
           echo ""
 
           # ── Collect the list of tags to verify ─────────────────────────────
-          if [ -n "$TAG" ]; then
+          # Detect whether TAG is a semver constraint (starts with an operator
+          # or range prefix) or a literal tag name.
+          IS_CONSTRAINT=false
+          if [ -n "$TAG" ] && printf '%s' "$TAG" | grep -qE '^[><=^~]'; then
+            IS_CONSTRAINT=true
+          fi
+
+          if [ -n "$TAG" ] && [ "$IS_CONSTRAINT" = "false" ]; then
+            # Literal tag — verify exactly this one release
             TAGS="$TAG"
           else
+            # Fetch every release via paginated REST API
             echo "Fetching release list for $REPO (paginated) ..."
-            # Use the REST API with --paginate so every page is fetched
-            # regardless of how many releases the repository has.
-            TAGS=$(gh api --paginate "/repos/$REPO/releases" --jq '.[].tag_name')
-            # Apply optional limit AFTER fetching all pages
+            ALL_TAGS=$(gh api --paginate "/repos/$REPO/releases" --jq '.[].tag_name')
+
+            if [ "$IS_CONSTRAINT" = "true" ]; then
+              echo "Applying semver constraint: $TAG"
+              TAGS=$(echo "$ALL_TAGS" | python3 /tmp/semver_filter.py "$TAG")
+            else
+              TAGS="$ALL_TAGS"
+            fi
+
+            # Apply optional limit AFTER fetching / filtering all pages
             if [ "${LIMIT:-0}" -gt 0 ]; then
               TAGS=$(echo "$TAGS" | head -n "$LIMIT")
             fi
-            if [ -z "$TAGS" ]; then
-              echo "No releases found for $REPO"
-              echo "verified=0" >> "$GITHUB_OUTPUT"
-              echo "failed=0"   >> "$GITHUB_OUTPUT"
-              {
-                echo "## Artifact Attestation Verification — \`$REPO\`"
-                echo ""
-                echo "> [!NOTE]"
-                echo "> No releases found."
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
+          fi
+
+          if [ -z "$TAGS" ]; then
+            MSG="No releases found"
+            [ "$IS_CONSTRAINT" = "true" ] && MSG="No releases match the constraint '${TAG}'"
+            echo "$MSG for $REPO"
+            echo "verified=0" >> "$GITHUB_OUTPUT"
+            echo "failed=0"   >> "$GITHUB_OUTPUT"
+            {
+              echo "## Artifact Attestation Verification — \`$REPO\`"
+              echo ""
+              echo "> [!NOTE]"
+              echo "> $MSG."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
 
           TOTAL_VERIFIED=0
@@ -103,9 +203,11 @@ jobs:
           RELEASE_ERRORS=0
           FAILED_LIST_FILE=$(mktemp)
 
-          # ── Begin step summary ──────────────────────────────────────────────
+          # ── Step summary header ─────────────────────────────────────────────
+          FILTER_NOTE=""
+          [ -n "$TAG" ] && FILTER_NOTE=" (filter: \`$TAG\`)"
           {
-            echo "## Artifact Attestation Verification — \`$REPO\`"
+            echo "## Artifact Attestation Verification — \`$REPO\`${FILTER_NOTE}"
             echo ""
             echo "| Release | Artifact | Status |"
             echo "|---------|----------|:------:|"
@@ -183,7 +285,7 @@ jobs:
           if [ "$TOTAL_FAILED" -gt 0 ]; then
             echo "::error::$TOTAL_FAILED artifact(s) failed attestation verification in $REPO"
 
-            # ── Open GitHub issue if requested ────────────────────────────────
+            # ── Open GitHub issue if requested ──────────────────────────────
             if [ "${OPEN_ISSUE:-false}" = "true" ]; then
               echo "Opening issue on $CALLER_REPO ..."
               {
