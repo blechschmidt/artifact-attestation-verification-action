@@ -4,19 +4,29 @@ on:
   workflow_call:
     inputs:
       repository:
-        description: 'Repository whose releases to verify (owner/repo format)'
-        required: true
+        description: >
+          Repository whose releases to verify (owner/repo format).
+          Defaults to the calling repository when not specified.
+        required: false
         type: string
+        default: ''
       tag:
-        description: 'Specific release tag to verify. If empty, all releases are checked.'
+        description: 'Specific release tag to verify. Checks all releases if not set.'
         required: false
         type: string
         default: ''
       limit:
-        description: 'Maximum number of releases to check (0 = all releases, ignored when tag is set)'
+        description: 'Maximum number of releases to check (0 = all, ignored when tag is set)'
         required: false
         type: number
         default: 0
+      open-issue:
+        description: >
+          Open a GitHub issue on the calling repository when verification fails.
+          Requires the calling workflow to grant issues: write permission.
+        required: false
+        type: boolean
+        default: false
     outputs:
       verified:
         description: 'Number of artifacts verified successfully'
@@ -27,10 +37,11 @@ on:
 
 jobs:
   verify:
-    name: Verify attestations for ${{ inputs.repository }}
+    name: Verify attestations for ${{ inputs.repository || github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: write
     outputs:
       verified: ${{ steps.verify.outputs.verified }}
       failed: ${{ steps.verify.outputs.failed }}
@@ -40,18 +51,28 @@ jobs:
         id: verify
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ inputs.repository }}
+          INPUT_REPO: ${{ inputs.repository }}
           TAG: ${{ inputs.tag }}
           LIMIT: ${{ inputs.limit }}
+          OPEN_ISSUE: ${{ inputs.open-issue }}
+          CALLER_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
 
-          echo "Repository: $REPO"
-          echo "Tag filter: ${TAG:-'(all releases)'}"
-          echo "Limit: ${LIMIT:-0}"
+          # Fall back to calling repository when no repository is specified
+          REPO="${INPUT_REPO:-}"
+          if [ -z "$REPO" ]; then
+            REPO="$CALLER_REPO"
+          fi
+
+          echo "Repository:            $REPO"
+          echo "Tag filter:            ${TAG:-(all releases)}"
+          echo "Limit:                 ${LIMIT:-0}"
+          echo "Open issue on failure: ${OPEN_ISSUE:-false}"
           echo ""
 
-          # Collect the list of tags to verify
+          # ── Collect the list of tags to verify ─────────────────────────────
           if [ -n "$TAG" ]; then
             TAGS="$TAG"
           else
@@ -65,7 +86,13 @@ jobs:
             if [ -z "$TAGS" ]; then
               echo "No releases found for $REPO"
               echo "verified=0" >> "$GITHUB_OUTPUT"
-              echo "failed=0" >> "$GITHUB_OUTPUT"
+              echo "failed=0"   >> "$GITHUB_OUTPUT"
+              {
+                echo "## Artifact Attestation Verification — \`$REPO\`"
+                echo ""
+                echo "> [!NOTE]"
+                echo "> No releases found."
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
           fi
@@ -73,7 +100,17 @@ jobs:
           TOTAL_VERIFIED=0
           TOTAL_FAILED=0
           RELEASE_ERRORS=0
+          FAILED_LIST_FILE=$(mktemp)
 
+          # ── Begin step summary ──────────────────────────────────────────────
+          {
+            echo "## Artifact Attestation Verification — \`$REPO\`"
+            echo ""
+            echo "| Release | Artifact | Status |"
+            echo "|---------|----------|:------:|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # ── Iterate releases ────────────────────────────────────────────────
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
             echo "::group::Release: $tag"
@@ -82,9 +119,10 @@ jobs:
             DOWNLOAD_OK=true
 
             if ! gh release download "$tag" --repo "$REPO" --dir "$WORKDIR" 2>&1; then
-              echo "Warning: Could not download assets for release '$tag' (release may have no uploaded assets)"
+              echo "Warning: Could not download assets for '$tag' (release may have no uploaded assets)"
               DOWNLOAD_OK=false
               RELEASE_ERRORS=$((RELEASE_ERRORS + 1))
+              echo "| \`$tag\` | _(no assets)_ | ⚠️ |" >> "$GITHUB_STEP_SUMMARY"
             fi
 
             if $DOWNLOAD_OK; then
@@ -97,14 +135,18 @@ jobs:
                 if gh attestation verify "$artifact" --repo "$REPO" 2>&1; then
                   echo "  ✓ $name — attestation verified"
                   TOTAL_VERIFIED=$((TOTAL_VERIFIED + 1))
+                  echo "| \`$tag\` | \`$name\` | ✅ |" >> "$GITHUB_STEP_SUMMARY"
                 else
                   echo "  ✗ $name — attestation verification FAILED"
                   TOTAL_FAILED=$((TOTAL_FAILED + 1))
+                  echo "| \`$tag\` | \`$name\` | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "- \`$tag\` / \`$name\`" >> "$FAILED_LIST_FILE"
                 fi
               done
 
               if [ "$ASSET_COUNT" -eq 0 ]; then
                 echo "  (No downloadable assets in this release)"
+                echo "| \`$tag\` | _(no assets)_ | ⚠️ |" >> "$GITHUB_STEP_SUMMARY"
               fi
             fi
 
@@ -112,20 +154,61 @@ jobs:
             echo "::endgroup::"
           done <<< "$TAGS"
 
+          # ── Summary footer ──────────────────────────────────────────────────
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "| | Count |"
+            echo "|---|---:|"
+            echo "| ✅ Verified | **$TOTAL_VERIFIED** |"
+            echo "| ❌ Failed   | **$TOTAL_FAILED** |"
+            if [ "$RELEASE_ERRORS" -gt 0 ]; then
+              echo "| ⚠️ Download errors | **$RELEASE_ERRORS** |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
           echo ""
           echo "============================================================"
           echo "Verification summary for $REPO"
           echo "  Artifacts verified:  $TOTAL_VERIFIED"
           echo "  Artifacts failed:    $TOTAL_FAILED"
-          if [ "$RELEASE_ERRORS" -gt 0 ]; then
-            echo "  Releases with download errors: $RELEASE_ERRORS"
-          fi
+          [ "$RELEASE_ERRORS" -gt 0 ] && echo "  Releases with download errors: $RELEASE_ERRORS"
           echo "============================================================"
 
           echo "verified=$TOTAL_VERIFIED" >> "$GITHUB_OUTPUT"
-          echo "failed=$TOTAL_FAILED" >> "$GITHUB_OUTPUT"
+          echo "failed=$TOTAL_FAILED"    >> "$GITHUB_OUTPUT"
 
           if [ "$TOTAL_FAILED" -gt 0 ]; then
             echo "::error::$TOTAL_FAILED artifact(s) failed attestation verification in $REPO"
+
+            # ── Open GitHub issue if requested ────────────────────────────────
+            if [ "${OPEN_ISSUE:-false}" = "true" ]; then
+              echo "Opening issue on $CALLER_REPO ..."
+              {
+                echo "## Attestation Verification Failures"
+                echo ""
+                echo "| Field | Value |"
+                echo "|-------|-------|"
+                echo "| **Repository checked** | \`$REPO\` |"
+                echo "| **Workflow run** | [$RUN_URL]($RUN_URL) |"
+                echo "| **Failed artifacts** | $TOTAL_FAILED |"
+                echo ""
+                echo "### Failed artifacts"
+                echo ""
+                cat "$FAILED_LIST_FILE"
+                echo ""
+                echo "---"
+                echo "*This issue was opened automatically by the [artifact attestation verification workflow]($RUN_URL).*"
+              } > /tmp/issue_body.md
+
+              gh issue create \
+                --repo "$CALLER_REPO" \
+                --title "❌ Attestation verification failed for \`$REPO\`" \
+                --body-file /tmp/issue_body.md \
+                --label "bug" \
+              || echo "::warning::Could not create issue — ensure the calling workflow grants \`issues: write\` permission"
+            fi
+
             exit 1
           fi
