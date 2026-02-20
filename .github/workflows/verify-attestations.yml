@@ -1,0 +1,131 @@
+name: Verify Artifact Attestations
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: 'Repository whose releases to verify (owner/repo format)'
+        required: true
+        type: string
+      tag:
+        description: 'Specific release tag to verify. If empty, all releases are checked.'
+        required: false
+        type: string
+        default: ''
+      limit:
+        description: 'Maximum number of releases to check (0 = all releases, ignored when tag is set)'
+        required: false
+        type: number
+        default: 0
+    outputs:
+      verified:
+        description: 'Number of artifacts verified successfully'
+        value: ${{ jobs.verify.outputs.verified }}
+      failed:
+        description: 'Number of artifacts that failed verification'
+        value: ${{ jobs.verify.outputs.failed }}
+
+jobs:
+  verify:
+    name: Verify attestations for ${{ inputs.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      verified: ${{ steps.verify.outputs.verified }}
+      failed: ${{ steps.verify.outputs.failed }}
+
+    steps:
+      - name: Verify artifact attestations
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ inputs.repository }}
+          TAG: ${{ inputs.tag }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          set -uo pipefail
+
+          echo "Repository: $REPO"
+          echo "Tag filter: ${TAG:-'(all releases)'}"
+          echo "Limit: ${LIMIT:-0}"
+          echo ""
+
+          # Collect the list of tags to verify
+          if [ -n "$TAG" ]; then
+            TAGS="$TAG"
+          else
+            LIMIT_ARG="--limit 1000"
+            if [ "${LIMIT:-0}" -gt 0 ]; then
+              LIMIT_ARG="--limit $LIMIT"
+            fi
+            echo "Fetching release list for $REPO ..."
+            # shellcheck disable=SC2086
+            TAGS=$(gh release list --repo "$REPO" $LIMIT_ARG --json tagName --jq '.[].tagName')
+            if [ -z "$TAGS" ]; then
+              echo "No releases found for $REPO"
+              echo "verified=0" >> "$GITHUB_OUTPUT"
+              echo "failed=0" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          TOTAL_VERIFIED=0
+          TOTAL_FAILED=0
+          RELEASE_ERRORS=0
+
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "::group::Release: $tag"
+
+            WORKDIR=$(mktemp -d)
+            DOWNLOAD_OK=true
+
+            if ! gh release download "$tag" --repo "$REPO" --dir "$WORKDIR" 2>&1; then
+              echo "Warning: Could not download assets for release '$tag' (release may have no uploaded assets)"
+              DOWNLOAD_OK=false
+              RELEASE_ERRORS=$((RELEASE_ERRORS + 1))
+            fi
+
+            if $DOWNLOAD_OK; then
+              ASSET_COUNT=0
+              for artifact in "$WORKDIR"/*; do
+                [ -e "$artifact" ] || continue
+                ASSET_COUNT=$((ASSET_COUNT + 1))
+                name=$(basename "$artifact")
+                echo "  Verifying: $name"
+                if gh attestation verify "$artifact" --repo "$REPO" 2>&1; then
+                  echo "  ✓ $name — attestation verified"
+                  TOTAL_VERIFIED=$((TOTAL_VERIFIED + 1))
+                else
+                  echo "  ✗ $name — attestation verification FAILED"
+                  TOTAL_FAILED=$((TOTAL_FAILED + 1))
+                fi
+              done
+
+              if [ "$ASSET_COUNT" -eq 0 ]; then
+                echo "  (No downloadable assets in this release)"
+              fi
+            fi
+
+            rm -rf "$WORKDIR"
+            echo "::endgroup::"
+          done <<< "$TAGS"
+
+          echo ""
+          echo "============================================================"
+          echo "Verification summary for $REPO"
+          echo "  Artifacts verified:  $TOTAL_VERIFIED"
+          echo "  Artifacts failed:    $TOTAL_FAILED"
+          if [ "$RELEASE_ERRORS" -gt 0 ]; then
+            echo "  Releases with download errors: $RELEASE_ERRORS"
+          fi
+          echo "============================================================"
+
+          echo "verified=$TOTAL_VERIFIED" >> "$GITHUB_OUTPUT"
+          echo "failed=$TOTAL_FAILED" >> "$GITHUB_OUTPUT"
+
+          if [ "$TOTAL_FAILED" -gt 0 ]; then
+            echo "::error::$TOTAL_FAILED artifact(s) failed attestation verification in $REPO"
+            exit 1
+          fi
