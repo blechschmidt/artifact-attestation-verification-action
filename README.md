@@ -13,7 +13,7 @@ artifacts originate from workflows within the declared repository.
 ```yaml
 jobs:
   verify:
-    uses: blechschmidt/artifact-attestation-verification-action/.github/workflows/verify-attestations.yml@main
+    uses: blechschmidt/artifact-attestation-verification-action/.github/workflows/verify-attestations.yml@v1
     with:
       repository: owner/repo   # optional: defaults to the calling repository
       tag: ">=1.2.0"           # optional: literal tag or semver constraint
