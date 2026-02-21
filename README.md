@@ -11,7 +11,7 @@ This workflow iterates through releases of a specified GitHub repository and ver
 ```yaml
 jobs:
   verify:
-    uses: blechschmidt/aritfact-attestation-verification-action/.github/workflows/verify-attestations.yml@main
+    uses: blechschmidt/artifact-attestation-verification-action/.github/workflows/verify-attestations.yml@main
     with:
       repository: owner/repo        # required
       tag: v1.2.3                   # optional: verify a specific release tag
